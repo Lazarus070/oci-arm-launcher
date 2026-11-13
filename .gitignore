@@ -1,0 +1,12 @@
+# Keys and credentials: never commit these
+*.pem
+*.pem*
+*.key
+oci_api_key*
+ssh_key.pub
+.env
+
+# Editor and OS noise
+.vscode/
+.DS_Store
+Thumbs.db

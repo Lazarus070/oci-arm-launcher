@@ -1,0 +1,133 @@
+name: OCI ARM VM Auto-Launcher
+
+# Tries to grab an Always Free ARM Ampere A1 instance in Oracle Cloud (eu-frankfurt-1).
+# Each run tries every availability domain in the region, because A1 capacity differs per AD.
+# Once the VM exists, the workflow disables itself.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   OCI_USER_OCID, OCI_TENANCY_OCID, OCI_FINGERPRINT, OCI_REGION,
+#   OCI_PRIVATE_KEY (FULL private key incl. BEGIN/END lines),
+#   OCI_COMPARTMENT_OCID, OCI_SUBNET_OCID, OCI_IMAGE_OCID (aarch64 image),
+#   SSH_PUBLIC_KEY (contents of your .pub file)
+
+on:
+  schedule:
+    # GitHub treats scheduled runs as best-effort; expect some delays.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: oci-arm-launcher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # lets the workflow disable itself after success
+
+jobs:
+  launch-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_CLI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True'
+      COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+      SUBNET_ID: ${{ secrets.OCI_SUBNET_OCID }}
+      IMAGE_ID: ${{ secrets.OCI_IMAGE_OCID }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      DISPLAY_NAME: arm-dev-server
+
+    steps:
+      - name: Install OCI CLI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/oci-venv"
+          "$RUNNER_TEMP/oci-venv/bin/pip" install --quiet oci-cli
+          echo "$RUNNER_TEMP/oci-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Verify credentials
+        run: |
+          if ! oci iam region-subscription list --tenancy-id "$OCI_CLI_TENANCY" > /dev/null 2> err.txt; then
+            echo "::error::OCI authentication failed. Check OCI_USER_OCID, OCI_TENANCY_OCID, OCI_FINGERPRINT, OCI_REGION and OCI_PRIVATE_KEY."
+            grep -E '"(code|message|status)"' err.txt || true
+            exit 1
+          fi
+          echo "OCI credentials OK."
+
+      - name: Check whether the VM already exists
+        id: existing
+        run: |
+          EXISTING=$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$DISPLAY_NAME" \
+            --all \
+            --query 'data[?"lifecycle-state"!=`TERMINATED`].id | [0]' \
+            --raw-output 2>/dev/null || true)
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Instance '$DISPLAY_NAME' already exists. Nothing to launch."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attempt VM launch (all availability domains)
+        id: launch
+        if: steps.existing.outputs.found == 'false'
+        run: |
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ssh_key.pub
+
+          # Availability domains are listed against the tenancy (root compartment).
+          mapfile -t ADS < <(oci iam availability-domain list \
+            --compartment-id "$OCI_CLI_TENANCY" --query 'data[].name' | jq -r '.[]')
+          if [ ${#ADS[@]} -eq 0 ]; then
+            echo "::error::Could not list availability domains."
+            exit 1
+          fi
+          echo "Found ${#ADS[@]} availability domain(s)."
+
+          echo "launched=false" >> "$GITHUB_OUTPUT"
+          for AD in "${ADS[@]}"; do
+            echo "Trying $AD ..."
+            set +e
+            OUTPUT=$(oci compute instance launch \
+              --availability-domain "$AD" \
+              --compartment-id "$COMPARTMENT_ID" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs 50 \
+              --ssh-authorized-keys-file ssh_key.pub \
+              --display-name "$DISPLAY_NAME" 2>&1)
+            STATUS=$?
+            set -e
+
+            if [ $STATUS -eq 0 ]; then
+              echo "launched=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::SUCCESS in $AD. '$DISPLAY_NAME' is provisioning. Find its public IP in the OCI console."
+              exit 0
+            elif echo "$OUTPUT" | grep -qiE 'out of (host )?capacity|"status": 500|InternalError'; then
+              echo "No capacity in $AD."
+            elif echo "$OUTPUT" | grep -qiE 'TooManyRequests|"status": 429'; then
+              echo "::warning::Throttled by OCI (429). Stopping this run; will retry on the next schedule."
+              exit 0
+            else
+              # Bad image/shape/subnet, LimitExceeded, permissions: retrying will never fix these.
+              echo "::error::Launch failed in $AD for a non-capacity reason:"
+              echo "$OUTPUT"
+              exit 1
+            fi
+          done
+          echo "::notice::No A1 capacity in any availability domain right now. Will retry on the next scheduled run."
+
+      - name: Disable this workflow after success
+        if: steps.launch.outputs.launched == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow disable "${{ github.workflow }}"
